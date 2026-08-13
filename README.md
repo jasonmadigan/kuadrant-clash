@@ -2,7 +2,11 @@
 
 A tiny, dependency-free rooftop fighting game, extracted from the Kuadrant Console Plugin easter egg.
 
-## Run it
+## Play it
+
+<https://jasonmadigan.github.io/kuadrant-clash/>
+
+## Run it locally
 
 Open `index.html` in a browser. That is the whole application: the JavaScript, CSS, and fighter portraits are embedded in the file, so it also works from any static web host with no build step.
 
