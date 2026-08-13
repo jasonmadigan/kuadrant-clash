@@ -7,7 +7,6 @@
       content="width=device-width, initial-scale=1, viewport-fit=cover"
     />
     <meta name="theme-color" content="#0b1020" />
-    <meta name="kuadrant-signaling-url" content="" />
     <meta
       name="kuadrant-ice-servers"
       content='[{"urls":"stun:stun.cloudflare.com:3478"}]'
@@ -631,7 +630,7 @@
         hidden
       >
         <div class="lobby-card">
-          <h2 id="lobby-title">Rooftop Relay</h2>
+          <h2 id="lobby-title">Direct Challenge</h2>
           <p
             id="connection-status"
             class="connection-status"
@@ -654,9 +653,40 @@
               </button>
             </div>
           </div>
+          <div id="answer-block" class="invite-block" hidden>
+            <label for="answer-code">
+              Send this answer code back to the host
+            </label>
+            <div class="invite-row">
+              <textarea
+                id="answer-code"
+                class="invite-link"
+                rows="3"
+                readonly
+              ></textarea>
+              <button id="copy-answer" class="action-button" type="button">
+                Copy answer
+              </button>
+            </div>
+          </div>
+          <div id="answer-entry-block" class="invite-block" hidden>
+            <label for="answer-input">Paste your opponent's answer code</label>
+            <div class="invite-row">
+              <textarea
+                id="answer-input"
+                class="invite-link"
+                rows="3"
+                autocomplete="off"
+                spellcheck="false"
+              ></textarea>
+              <button id="connect-answer" class="action-button" type="button">
+                Connect
+              </button>
+            </div>
+          </div>
           <p class="lobby-note">
-            The server only introduces the browsers. Match inputs and state then
-            travel over an encrypted peer-to-peer WebRTC connection.
+            No game server is involved. The link carries the host's WebRTC
+            offer; the answer code completes the direct encrypted connection.
           </p>
           <button id="cancel-lobby" class="action-button" type="button">
             Cancel challenge
@@ -984,6 +1014,12 @@
         const connectionStatus = document.querySelector("#connection-status");
         const inviteBlock = document.querySelector("#invite-block");
         const inviteLink = document.querySelector("#invite-link");
+        const answerBlock = document.querySelector("#answer-block");
+        const answerCode = document.querySelector("#answer-code");
+        const answerEntryBlock = document.querySelector(
+          "#answer-entry-block"
+        );
+        const answerInput = document.querySelector("#answer-input");
         const canvas = document.querySelector("#game");
         const context = canvas.getContext("2d");
         const portraitImages = combatants.map(({ portrait }) => {
@@ -1007,14 +1043,16 @@
         let tournament = null;
         let networkSession = null;
         let networkRole = null;
-        let networkRoomId = null;
         let networkRemoteFighterIndex = null;
         let networkRemoteInput = createEmptyInput();
         let networkLocalRematch = false;
         let networkRemoteRematch = false;
+        let networkConnectionInterrupted = false;
         let lastNetworkInput = "";
         let lastNetworkInputAt = 0;
         let lastNetworkSnapshotAt = 0;
+        let networkSnapshotSequence = 0;
+        let lastAppliedNetworkSnapshotSequence = -1;
         let state = null;
         let animationFrame = 0;
         let previousFrame = 0;
@@ -1022,12 +1060,19 @@
         context.imageSmoothingEnabled = false;
 
         const pageParameters = new URLSearchParams(window.location.search);
-        const requestedRoomId = pageParameters.get("room");
-        let invitationRoomId = /^[A-Za-z0-9_-]{20,64}$/.test(
-          requestedRoomId || ""
-        )
-          ? requestedRoomId
-          : null;
+        const fragmentParameters = new URLSearchParams(
+          window.location.hash.slice(1)
+        );
+        let invitationCode = fragmentParameters.get("offer");
+        let invitationOffer = null;
+        let invitationError = null;
+        if (invitationCode) {
+          try {
+            invitationOffer = decodeSessionDescription(invitationCode, "offer");
+          } catch (error) {
+            invitationError = error;
+          }
+        }
 
         function clearInputState() {
           heldKeys.clear();
@@ -1053,35 +1098,6 @@
           };
         }
 
-        function wait(milliseconds) {
-          return new Promise((resolve) => setTimeout(resolve, milliseconds));
-        }
-
-        function signalingBaseUrl() {
-          const queryValue = pageParameters.get("signal");
-          const configuredValue = document
-            .querySelector('meta[name="kuadrant-signaling-url"]')
-            .content.trim();
-          const candidate = queryValue || configuredValue || window.location.origin;
-          try {
-            const url = new URL(candidate, window.location.href);
-            const isLocalHttp =
-              url.protocol === "http:" &&
-              ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname);
-            const isSameOrigin = url.origin === window.location.origin;
-            if (url.protocol !== "https:" && !isLocalHttp && !isSameOrigin) {
-              throw new Error("Cross-origin signalling must use HTTPS");
-            }
-            return url.origin;
-          } catch (error) {
-            throw new Error(
-              error instanceof Error
-                ? `Invalid signalling URL: ${error.message}`
-                : "Invalid signalling URL"
-            );
-          }
-        }
-
         function configuredIceServers() {
           try {
             const configuredValue = document.querySelector(
@@ -1094,94 +1110,84 @@
           }
         }
 
-        function createRoomId() {
-          const bytes = new Uint8Array(18);
-          window.crypto.getRandomValues(bytes);
-          return Array.from(bytes, (byte) =>
-            byte.toString(16).padStart(2, "0")
-          ).join("");
+        function validateSessionDescription(description, expectedType) {
+          if (
+            !["offer", "answer"].includes(expectedType) ||
+            !description ||
+            description.type !== expectedType ||
+            typeof description.sdp !== "string" ||
+            description.sdp.length === 0 ||
+            description.sdp.length > 64 * 1024
+          ) {
+            throw new Error(`Invalid WebRTC ${expectedType} code`);
+          }
+          return { type: description.type, sdp: description.sdp };
         }
 
-        function createInviteUrl(roomId) {
+        function encodeSessionDescription(description) {
+          const normalized = validateSessionDescription(
+            description,
+            description?.type
+          );
+          const bytes = new TextEncoder().encode(JSON.stringify(normalized));
+          let binary = "";
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          return btoa(binary)
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+        }
+
+        function decodeSessionDescription(value, expectedType) {
+          let encoded = String(value || "").trim();
+          try {
+            const sharedUrl = new URL(encoded);
+            encoded =
+              new URLSearchParams(sharedUrl.hash.slice(1)).get(expectedType) ||
+              encoded;
+          } catch {
+            if (encoded.startsWith("#")) {
+              encoded =
+                new URLSearchParams(encoded.slice(1)).get(expectedType) || "";
+            }
+          }
+          if (!/^[A-Za-z0-9_-]+$/.test(encoded) || encoded.length > 96 * 1024) {
+            throw new Error(`Invalid WebRTC ${expectedType} code`);
+          }
+          try {
+            const padded = encoded.replace(/-/g, "+").replace(/_/g, "/");
+            const binary = atob(
+              padded + "=".repeat((4 - (padded.length % 4)) % 4)
+            );
+            const bytes = Uint8Array.from(binary, (character) =>
+              character.charCodeAt(0)
+            );
+            return validateSessionDescription(
+              JSON.parse(new TextDecoder().decode(bytes)),
+              expectedType
+            );
+          } catch (error) {
+            if (error instanceof Error && error.message.startsWith("Invalid")) {
+              throw error;
+            }
+            throw new Error(`Invalid WebRTC ${expectedType} code`);
+          }
+        }
+
+        function createInviteUrl(description) {
           const url = new URL(window.location.href);
           url.searchParams.set("mode", "multiplayer");
-          url.searchParams.set("room", roomId);
-          const signalUrl = signalingBaseUrl();
-          if (signalUrl !== window.location.origin) {
-            url.searchParams.set("signal", signalUrl);
-          } else {
-            url.searchParams.delete("signal");
-          }
-          url.hash = "";
+          url.searchParams.delete("room");
+          url.searchParams.delete("signal");
+          url.hash = new URLSearchParams({
+            offer: encodeSessionDescription(description),
+          }).toString();
           return url.toString();
-        }
-
-        function createSignalingAdapter({
-          baseUrl,
-          roomId,
-          role,
-          onMessage,
-          onError,
-        }) {
-          const recipient = role === "host" ? "guest" : "host";
-          const clientId = createRoomId();
-          let lastMessageId = 0;
-          let closed = false;
-          let pollController = null;
-
-          async function send(payload) {
-            const response = await fetch(
-              `${baseUrl}/signal/${roomId}/${recipient}`,
-              {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({ from: role, clientId, payload }),
-              }
-            );
-            if (!response.ok) {
-              throw new Error(`Signalling failed (${response.status})`);
-            }
-          }
-
-          async function poll() {
-            while (!closed) {
-              pollController = new AbortController();
-              try {
-                const response = await fetch(
-                  `${baseUrl}/signal/${roomId}/${role}?after=${lastMessageId}&client=${clientId}`,
-                  { signal: pollController.signal }
-                );
-                if (!response.ok) {
-                  throw new Error(`Signalling failed (${response.status})`);
-                }
-                const body = await response.json();
-                for (const message of body.messages || []) {
-                  lastMessageId = Math.max(lastMessageId, message.id);
-                  await onMessage(message.payload);
-                }
-              } catch (error) {
-                if (closed || error.name === "AbortError") return;
-                onError(error);
-                await wait(1000);
-              }
-            }
-          }
-
-          return {
-            start() {
-              void poll();
-            },
-            send,
-            close() {
-              closed = true;
-              pollController?.abort();
-            },
-          };
         }
 
         function createPeerAdapter({
           role,
-          roomId,
+          onLocalDescription,
           onReady,
           onControl,
           onState,
@@ -1191,14 +1197,15 @@
           if (typeof RTCPeerConnection === "undefined") {
             throw new Error("This browser does not support WebRTC multiplayer");
           }
+          if (!["host", "guest"].includes(role)) {
+            throw new Error("A valid multiplayer role is required");
+          }
 
           const peer = new RTCPeerConnection({
             iceServers: configuredIceServers(),
           });
-          const pendingCandidates = [];
           let controlChannel = null;
           let stateChannel = null;
-          let signaler = null;
           let ready = false;
 
           function parseMessage(event, handler, maxBytes) {
@@ -1261,36 +1268,33 @@
             peer.ondatachannel = ({ channel }) => bindChannel(channel);
           }
 
-          async function handleSignal(message) {
-            if (message.type === "description") {
-              await peer.setRemoteDescription(message.description);
-              while (pendingCandidates.length > 0) {
-                await peer.addIceCandidate(pendingCandidates.shift());
-              }
-              if (message.description.type === "offer") {
-                const answer = await peer.createAnswer();
-                await peer.setLocalDescription(answer);
-                await signaler.send({
-                  type: "description",
-                  description: peer.localDescription,
-                });
-              }
-            } else if (message.type === "candidate" && message.candidate) {
-              if (peer.remoteDescription) {
-                await peer.addIceCandidate(message.candidate);
-              } else {
-                pendingCandidates.push(message.candidate);
-              }
+          function waitForIceGathering() {
+            if (
+              peer.iceGatheringState === "complete" ||
+              typeof peer.addEventListener !== "function"
+            ) {
+              return Promise.resolve();
             }
+            return new Promise((resolve) => {
+              const finish = () => {
+                clearTimeout(timeout);
+                peer.removeEventListener("icegatheringstatechange", checkState);
+                resolve();
+              };
+              const checkState = () => {
+                if (peer.iceGatheringState === "complete") finish();
+              };
+              const timeout = setTimeout(finish, 8000);
+              peer.addEventListener("icegatheringstatechange", checkState);
+            });
           }
 
-          peer.onicecandidate = ({ candidate }) => {
-            if (candidate) {
-              signaler
-                ?.send({ type: "candidate", candidate })
-                .catch(onError);
-            }
-          };
+          async function setLocalDescription(description) {
+            await peer.setLocalDescription(description);
+            await waitForIceGathering();
+            return peer.localDescription || description;
+          }
+
           peer.onconnectionstatechange = () => {
             onStatus(peer.connectionState);
             if (peer.connectionState === "failed") {
@@ -1302,24 +1306,29 @@
             get ready() {
               return ready;
             },
-            async start() {
-              signaler = createSignalingAdapter({
-                baseUrl: signalingBaseUrl(),
-                roomId,
-                role,
-                onMessage: (message) => handleSignal(message).catch(onError),
-                onError,
-              });
-              signaler.start();
-              onStatus("signalling");
+            async start(remoteOffer = null) {
+              onStatus("preparing");
               if (role === "host") {
                 const offer = await peer.createOffer();
-                await peer.setLocalDescription(offer);
-                await signaler.send({
-                  type: "description",
-                  description: peer.localDescription,
-                });
+                onLocalDescription(await setLocalDescription(offer));
+                onStatus("awaiting-answer");
+              } else {
+                await peer.setRemoteDescription(
+                  validateSessionDescription(remoteOffer, "offer")
+                );
+                const answer = await peer.createAnswer();
+                onLocalDescription(await setLocalDescription(answer));
+                onStatus("awaiting-host");
               }
+            },
+            async acceptAnswer(remoteAnswer) {
+              if (role !== "host") {
+                throw new Error("Only the host can accept an answer code");
+              }
+              onStatus("connecting");
+              await peer.setRemoteDescription(
+                validateSessionDescription(remoteAnswer, "answer")
+              );
             },
             sendControl(message) {
               if (controlChannel?.readyState !== "open") return false;
@@ -1337,7 +1346,6 @@
               return true;
             },
             close() {
-              signaler?.close();
               controlChannel?.close();
               stateChannel?.close();
               peer.close();
@@ -1896,13 +1904,160 @@
           };
         }
 
-        function applyNetworkSnapshot(snapshot) {
+        function finiteNumber(value, minimum, maximum) {
+          return (
+            typeof value === "number" &&
+            Number.isFinite(value) &&
+            value >= minimum &&
+            value <= maximum
+          );
+        }
+
+        function normalizeNetworkFighter(fighter, groundY) {
+          if (
+            !fighter ||
+            !Number.isInteger(fighter.portraitIndex) ||
+            fighter.portraitIndex < 0 ||
+            fighter.portraitIndex >= fighters.length ||
+            !finiteNumber(fighter.x, -GAME_WIDTH, GAME_WIDTH * 2) ||
+            !finiteNumber(fighter.y, -GAME_HEIGHT, groundY) ||
+            !finiteNumber(fighter.velocityX, -5000, 5000) ||
+            !finiteNumber(fighter.velocityY, -5000, 5000) ||
+            ![-1, 1].includes(fighter.facing) ||
+            !finiteNumber(fighter.health, 0, 100) ||
+            ![
+              "idle",
+              "walk",
+              "duck",
+              "jump",
+              "punch",
+              "kick",
+              "special",
+              "hit",
+              "ko",
+            ].includes(fighter.action) ||
+            !finiteNumber(fighter.actionStartedAt, 0, Number.MAX_SAFE_INTEGER) ||
+            !(
+              fighter.actionEndsAt === null ||
+              fighter.actionEndsAt === Number.POSITIVE_INFINITY ||
+              finiteNumber(fighter.actionEndsAt, 0, Number.MAX_SAFE_INTEGER)
+            ) ||
+            typeof fighter.attackConnected !== "boolean" ||
+            !finiteNumber(fighter.nextSpecialAt, 0, Number.MAX_SAFE_INTEGER)
+          ) {
+            return null;
+          }
+          return {
+            x: fighter.x,
+            y: fighter.y,
+            velocityX: fighter.velocityX,
+            velocityY: fighter.velocityY,
+            facing: fighter.facing,
+            health: fighter.health,
+            maxHealth: 100,
+            action: fighter.action,
+            actionStartedAt: fighter.actionStartedAt,
+            actionEndsAt:
+              fighter.actionEndsAt === Number.POSITIVE_INFINITY
+                ? null
+                : fighter.actionEndsAt,
+            attackConnected: fighter.attackConnected,
+            nextSpecialAt: fighter.nextSpecialAt,
+            isBoss: false,
+            speedMultiplier: 1,
+            damageMultiplier: 1,
+            portraitIndex: fighter.portraitIndex,
+          };
+        }
+
+        function normalizeNetworkSnapshot(snapshot) {
           if (
             !snapshot ||
+            !Number.isSafeInteger(snapshot.sequence) ||
+            snapshot.sequence < 0 ||
             snapshot.mode !== "multiplayer" ||
-            !snapshot.player ||
-            !snapshot.cpu ||
-            !Array.isArray(snapshot.projectiles)
+            !finiteNumber(snapshot.groundY, GAME_HEIGHT / 2, GAME_HEIGHT) ||
+            !finiteNumber(snapshot.remainingMs, 0, ROUND_LENGTH_MS) ||
+            !["fighting", "player-won", "cpu-won", "draw"].includes(
+              snapshot.status
+            ) ||
+            !Array.isArray(snapshot.projectiles) ||
+            snapshot.projectiles.length > 32
+          ) {
+            return null;
+          }
+
+          const player = normalizeNetworkFighter(
+            snapshot.player,
+            snapshot.groundY
+          );
+          const cpu = normalizeNetworkFighter(snapshot.cpu, snapshot.groundY);
+          if (!player || !cpu) return null;
+
+          let impact = null;
+          if (snapshot.impact !== null) {
+            if (
+              !snapshot.impact ||
+              !finiteNumber(snapshot.impact.x, -GAME_WIDTH, GAME_WIDTH * 2) ||
+              !finiteNumber(snapshot.impact.y, -GAME_HEIGHT, GAME_HEIGHT * 2) ||
+              !finiteNumber(snapshot.impact.at, 0, Number.MAX_SAFE_INTEGER)
+            ) {
+              return null;
+            }
+            impact = {
+              x: snapshot.impact.x,
+              y: snapshot.impact.y,
+              at: snapshot.impact.at,
+            };
+          }
+
+          const projectiles = [];
+          for (const projectile of snapshot.projectiles) {
+            const special = fighters.find(
+              (fighter) => fighter.special.kind === projectile?.kind
+            )?.special;
+            if (
+              !special ||
+              !["player", "cpu"].includes(projectile.ownerSide) ||
+              !finiteNumber(projectile.x, -GAME_WIDTH, GAME_WIDTH * 2) ||
+              !finiteNumber(projectile.y, -GAME_HEIGHT, GAME_HEIGHT * 2) ||
+              !finiteNumber(projectile.velocityX, -2000, 2000) ||
+              !finiteNumber(projectile.spawnAt, 0, Number.MAX_SAFE_INTEGER) ||
+              !finiteNumber(projectile.createdAt, 0, Number.MAX_SAFE_INTEGER)
+            ) {
+              return null;
+            }
+            projectiles.push({
+              ...special,
+              ownerSide: projectile.ownerSide,
+              x: projectile.x,
+              y: projectile.y,
+              velocityX: projectile.velocityX,
+              spawnAt: projectile.spawnAt,
+              createdAt: projectile.createdAt,
+            });
+          }
+
+          return {
+            sequence: snapshot.sequence,
+            mode: "multiplayer",
+            roundIndex: 0,
+            totalRounds: 1,
+            groundY: snapshot.groundY,
+            remainingMs: snapshot.remainingMs,
+            status: snapshot.status,
+            impact,
+            player,
+            cpu,
+            projectiles,
+          };
+        }
+
+        function applyNetworkSnapshot(snapshot) {
+          const normalized = normalizeNetworkSnapshot(snapshot);
+          if (
+            !normalized ||
+            normalized.sequence <= lastAppliedNetworkSnapshotSequence
           ) {
             return false;
           }
@@ -1913,30 +2068,31 @@
               mode: "multiplayer",
               roundIndex: 0,
               totalRounds: 1,
-              groundY: snapshot.groundY,
-              remainingMs: snapshot.remainingMs,
-              status: snapshot.status,
-              impact: snapshot.impact,
-              player: { ...snapshot.player },
-              cpu: { ...snapshot.cpu },
+              groundY: normalized.groundY,
+              remainingMs: normalized.remainingMs,
+              status: normalized.status,
+              impact: normalized.impact,
+              player: normalized.player,
+              cpu: normalized.cpu,
               projectiles: [],
               resultSynced: false,
             };
           } else {
-            state.groundY = snapshot.groundY;
-            state.remainingMs = snapshot.remainingMs;
-            state.status = snapshot.status;
-            state.impact = snapshot.impact;
-            Object.assign(state.player, snapshot.player);
-            Object.assign(state.cpu, snapshot.cpu);
+            state.groundY = normalized.groundY;
+            state.remainingMs = normalized.remainingMs;
+            state.status = normalized.status;
+            state.impact = normalized.impact;
+            Object.assign(state.player, normalized.player);
+            Object.assign(state.cpu, normalized.cpu);
           }
 
-          state.projectiles = snapshot.projectiles.map(
+          state.projectiles = normalized.projectiles.map(
             ({ ownerSide, ...projectile }) => ({
               ...projectile,
               owner: ownerSide === "player" ? state.player : state.cpu,
             })
           );
+          lastAppliedNetworkSnapshotSequence = normalized.sequence;
           if (previousStatus !== state.status) state.resultSynced = false;
           return true;
         }
@@ -2386,6 +2542,8 @@
             gameState.roundIndex === gameState.totalRounds - 1;
           const heading = tournamentComplete
             ? "CHAMPION!"
+            : gameState.status === "disconnected"
+            ? "DISCONNECTED"
             : gameState.mode === "tournament" &&
               gameState.status === "player-won"
             ? "ROUND CLEAR"
@@ -2397,7 +2555,9 @@
           ctx.fillStyle = palette.white;
           ctx.font = "bold 34px monospace";
           const result =
-            gameState.status === "player-won"
+            gameState.status === "disconnected"
+              ? "Opponent disconnected"
+              : gameState.status === "player-won"
               ? `${combatants[gameState.player.portraitIndex].name} wins`
               : gameState.status === "cpu-won"
               ? `${combatants[gameState.cpu.portraitIndex].name} wins`
@@ -2405,7 +2565,9 @@
           ctx.fillText(result.toUpperCase(), GAME_WIDTH / 2, 290);
           ctx.font = "bold 20px monospace";
           ctx.fillText(
-            gameState.mode === "tournament"
+            gameState.status === "disconnected"
+              ? "RETURN TO FIGHTER SELECTION"
+              : gameState.mode === "tournament"
               ? gameState.status === "player-won" &&
                 gameState.roundIndex < gameState.totalRounds - 1
                 ? "PRESS ENTER FOR THE NEXT FIGHT"
@@ -2549,9 +2711,9 @@
             mode === "tournament"
               ? "Fight the roster, then survive two escalating bosses."
               : mode === "multiplayer"
-              ? invitationRoomId
+              ? invitationCode
                 ? "Challenge received. Choose your fighter to join."
-                : "Choose a fighter to create a shareable peer-to-peer challenge."
+                : "Choose a fighter, share a link, then paste back their answer."
               : "One opponent. Minimal paperwork.";
         }
 
@@ -2574,13 +2736,16 @@
           selectScreen.hidden = true;
           gameScreen.hidden = true;
           multiplayerLobby.hidden = false;
-          inviteBlock.hidden = networkRole !== "host";
-          if (networkRole === "host") {
-            inviteLink.value = createInviteUrl(networkRoomId);
-            setConnectionStatus("Challenge ready. Waiting for an opponent…");
-          } else {
-            setConnectionStatus("Joining challenge…");
-          }
+          inviteBlock.hidden = true;
+          answerBlock.hidden = true;
+          answerEntryBlock.hidden = true;
+          inviteLink.value = "";
+          answerCode.value = "";
+          answerInput.value = "";
+          document.querySelector("#copy-invite").textContent = "Copy link";
+          document.querySelector("#copy-answer").textContent = "Copy answer";
+          document.querySelector("#connect-answer").disabled = false;
+          setConnectionStatus("Preparing direct challenge…");
           multiplayerLobby.scrollIntoView({
             behavior: "smooth",
             block: "start",
@@ -2602,21 +2767,43 @@
         }
 
         function handleNetworkStatus(status) {
-          if (status === "signalling") {
-            setConnectionStatus("Contacting Rooftop Relay…");
+          if (status === "preparing") {
+            setConnectionStatus("Gathering the direct connection details…");
+          } else if (status === "awaiting-answer") {
+            setConnectionStatus(
+              "Send the challenge link, then paste the returned answer below."
+            );
+          } else if (status === "awaiting-host") {
+            setConnectionStatus(
+              "Send the answer code to the host. Keep this page open."
+            );
           } else if (status === "connecting" || status === "new") {
             setConnectionStatus("Negotiating the peer-to-peer route…");
           } else if (status === "connected") {
+            networkConnectionInterrupted = false;
+            if (state?.mode === "multiplayer") {
+              boutLabel.textContent = `Peer fight · ${
+                combatants[state.player.portraitIndex].name
+              } vs ${combatants[state.cpu.portraitIndex].name}`;
+            }
             setConnectionStatus("Peer connected. Reconciling fighters…");
           } else if (status === "disconnected") {
+            networkConnectionInterrupted = true;
+            clearInputState();
             if (state?.mode === "multiplayer") {
               boutLabel.textContent = "Policy propagation interrupted…";
             } else {
               setConnectionStatus("Connection interrupted. Retrying…");
             }
           } else if (status === "failed" || status === "closed") {
+            networkConnectionInterrupted = false;
             if (state?.mode === "multiplayer") {
               boutLabel.textContent = "Opponent disconnected";
+              state.status = "disconnected";
+              state.resultSynced = true;
+              roundAction.hidden = true;
+              roundAction.disabled = true;
+              clearInputState();
             } else {
               setConnectionStatus("The challenge connection closed.");
             }
@@ -2657,6 +2844,7 @@
           lastNetworkSnapshotAt = 0;
           networkLocalRematch = false;
           networkRemoteRematch = false;
+          networkConnectionInterrupted = false;
           openMultiplayerGame();
           animationFrame = requestAnimationFrame(renderFrame);
         }
@@ -2722,19 +2910,32 @@
 
         async function startMultiplayer(portraitIndex) {
           selectedPortraitIndex = portraitIndex;
-          networkRole = invitationRoomId ? "guest" : "host";
-          networkRoomId = invitationRoomId || createRoomId();
+          networkRole = invitationCode ? "guest" : "host";
           networkRemoteFighterIndex = null;
           networkRemoteInput = createEmptyInput();
           networkLocalRematch = false;
           networkRemoteRematch = false;
+          networkConnectionInterrupted = false;
+          networkSnapshotSequence = 0;
+          lastAppliedNetworkSnapshotSequence = -1;
 
           try {
-            signalingBaseUrl();
             showMultiplayerLobby();
+            if (networkRole === "guest" && !invitationOffer) {
+              throw invitationError || new Error("Invalid WebRTC challenge link");
+            }
             networkSession = createPeerAdapter({
               role: networkRole,
-              roomId: networkRoomId,
+              onLocalDescription: (description) => {
+                if (networkRole === "host") {
+                  inviteLink.value = createInviteUrl(description);
+                  inviteBlock.hidden = false;
+                  answerEntryBlock.hidden = false;
+                } else {
+                  answerCode.value = encodeSessionDescription(description);
+                  answerBlock.hidden = false;
+                }
+              },
               onReady: () => {
                 sendNetworkFighter();
                 setConnectionStatus(
@@ -2748,7 +2949,7 @@
               onStatus: handleNetworkStatus,
               onError: handleNetworkError,
             });
-            await networkSession.start();
+            await networkSession.start(invitationOffer);
           } catch (error) {
             multiplayerLobby.hidden = false;
             selectScreen.hidden = true;
@@ -2784,8 +2985,12 @@
           }
           networkSession.sendState({
             type: "snapshot",
-            state: serializeNetworkState(state),
+            state: {
+              ...serializeNetworkState(state),
+              sequence: networkSnapshotSequence,
+            },
           });
+          networkSnapshotSequence += 1;
           lastNetworkSnapshotAt = now;
         }
 
@@ -2794,19 +2999,26 @@
           networkSession?.close();
           networkSession = null;
           networkRole = null;
-          networkRoomId = null;
           networkRemoteFighterIndex = null;
           networkRemoteInput = createEmptyInput();
           networkLocalRematch = false;
           networkRemoteRematch = false;
+          networkConnectionInterrupted = false;
+          networkSnapshotSequence = 0;
+          lastAppliedNetworkSnapshotSequence = -1;
           inviteBlock.hidden = true;
+          answerBlock.hidden = true;
+          answerEntryBlock.hidden = true;
           multiplayerLobby.hidden = true;
           if (clearInvitation) {
-            invitationRoomId = null;
+            invitationCode = null;
+            invitationOffer = null;
+            invitationError = null;
             const url = new URL(window.location.href);
             url.searchParams.delete("room");
             url.searchParams.delete("signal");
             url.searchParams.delete("mode");
+            url.hash = "";
             window.history.replaceState({}, "", url);
           }
         }
@@ -2828,21 +3040,23 @@
           queuedActions.special = false;
 
           if (state.mode === "multiplayer") {
-            if (networkRole === "host") {
-              stepMultiplayerGame(
-                state,
-                input,
-                consumeNetworkInput(),
-                now,
-                (now - previousFrame) / 1000
-              );
-              if (state.status === "fighting") {
-                sendHostSnapshot(now);
-              } else if (!state.resultSynced) {
-                sendHostSnapshot(now, true);
+            if (!networkConnectionInterrupted) {
+              if (networkRole === "host") {
+                stepMultiplayerGame(
+                  state,
+                  input,
+                  consumeNetworkInput(),
+                  now,
+                  (now - previousFrame) / 1000
+                );
+                if (state.status === "fighting") {
+                  sendHostSnapshot(now);
+                } else if (!state.resultSynced) {
+                  sendHostSnapshot(now, true);
+                }
+              } else {
+                sendGuestInput(input, now);
               }
-            } else {
-              sendGuestInput(input, now);
             }
           } else {
             stepGame(state, input, now, (now - previousFrame) / 1000);
@@ -2997,15 +3211,50 @@
           });
         });
 
-        document.querySelector("#copy-invite").addEventListener("click", async () => {
+        async function copyLobbyValue(field, button, label) {
           try {
-            await navigator.clipboard.writeText(inviteLink.value);
-            document.querySelector("#copy-invite").textContent = "Copied!";
+            await navigator.clipboard.writeText(field.value);
+            button.textContent = "Copied!";
           } catch {
-            inviteLink.select();
-            setConnectionStatus("Link selected. Copy it from the field.");
+            field.select();
+            setConnectionStatus(`${label} selected. Copy it from the field.`);
           }
+        }
+
+        document.querySelector("#copy-invite").addEventListener("click", () => {
+          void copyLobbyValue(
+            inviteLink,
+            document.querySelector("#copy-invite"),
+            "Link"
+          );
         });
+        document.querySelector("#copy-answer").addEventListener("click", () => {
+          void copyLobbyValue(
+            answerCode,
+            document.querySelector("#copy-answer"),
+            "Answer code"
+          );
+        });
+        document
+          .querySelector("#connect-answer")
+          .addEventListener("click", async () => {
+            const button = document.querySelector("#connect-answer");
+            button.disabled = true;
+            try {
+              if (!networkSession) {
+                throw new Error("Create a challenge before adding an answer");
+              }
+              const answer = decodeSessionDescription(
+                answerInput.value,
+                "answer"
+              );
+              await networkSession.acceptAnswer(answer);
+              setConnectionStatus("Answer accepted. Connecting directly…");
+            } catch (error) {
+              button.disabled = false;
+              handleNetworkError(error);
+            }
+          });
         document.querySelector("#cancel-lobby").addEventListener("click", () => {
           resetNetworkSession();
           state = null;
@@ -3040,7 +3289,7 @@
         });
 
         renderRoster();
-        if (invitationRoomId || pageParameters.get("mode") === "multiplayer") {
+        if (invitationCode || pageParameters.get("mode") === "multiplayer") {
           setSelectedMode("multiplayer");
         }
       })();

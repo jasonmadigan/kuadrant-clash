@@ -8,20 +8,9 @@ A tiny, dependency-free rooftop fighting game, extracted from the Kuadrant Conso
 
 ## Run it locally
 
-For Quick Fight and Tournament, open `index.html` directly. The JavaScript, CSS,
-and fighter portraits are embedded in the file, so those modes work on any
-static host with no build step.
-
-For peer-to-peer multiplayer, start the included signalling server:
-
-```sh
-npm start
-```
-
-Then visit <http://127.0.0.1:8000>. Choose **Multiplayer**, pick a fighter, and
-share the displayed challenge link. The other player opens it and chooses their
-fighter. The server exchanges the WebRTC handshake; match inputs and state then
-travel directly between the browsers over encrypted WebRTC data channels.
+Open `index.html` directly, or serve the repository with any static file server.
+The JavaScript, CSS, fighter portraits, and multiplayer handshake are embedded
+in the file, so there is no build step or application server.
 
 Controls:
 
@@ -47,29 +36,30 @@ Touch controls appear automatically on touch-first devices and in narrow browser
 windows. Mobile layouts support portrait and landscape orientation, including
 safe areas around notches and home indicators.
 
-## Multiplayer deployment
+## Multiplayer
 
-The Node server has no third-party dependencies and serves both the game and the
-long-poll signalling endpoint. Set `HOST` and `PORT` when deploying it:
+Multiplayer uses a manual WebRTC handshake so it can run from a completely
+static site:
 
-```sh
-HOST=0.0.0.0 PORT=8080 npm start
-```
+1. The host chooses **Multiplayer**, picks a fighter, and sends the generated
+   challenge link to the other player.
+2. The guest opens the link, picks a fighter, and sends the generated answer
+   code back to the host.
+3. The host pastes that answer into the original game tab and selects
+   **Connect**.
 
-WebRTC requires HTTPS outside localhost. The default ICE configuration uses
-Cloudflare's public STUN endpoint. For reliable connections across restrictive
-NATs and firewalls, replace the `kuadrant-ice-servers` meta value in `index.html`
-with your own authorized TURN configuration.
+Keep both game tabs open during the exchange. The WebRTC offer is stored in the
+challenge URL fragment, so it is not sent to the static web host. After the
+answer is pasted, match inputs and state travel directly between the browsers
+over encrypted WebRTC data channels.
 
-If the game remains on a static host such as GitHub Pages, deploy `server.mjs`
-separately and set the `kuadrant-signaling-url` meta value to its HTTPS origin.
-Challenge links automatically carry that signalling origin to the joining
-player.
+The default ICE configuration uses Cloudflare's public STUN endpoint for NAT
+discovery. There is deliberately no TURN relay, so multiplayer may not connect
+between some restrictive corporate or mobile networks.
 
 ## Deploy it
 
-For the single-player modes, copy `index.html` to any static host. For example,
-with Python installed:
+Copy `index.html` to any static host. For local testing with Python installed:
 
 ```sh
 python3 -m http.server 8000

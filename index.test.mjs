@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import { test } from "node:test";
 import vm from "node:vm";
-import { createKuadrantServer } from "./server.mjs";
 
 class FakeElement {
   constructor() {
@@ -95,9 +94,17 @@ function createFakeRtcNetwork() {
     constructor() {
       this.channels = [];
       this.connectionState = "new";
+      this.iceGatheringState = "new";
       this.localDescription = null;
+      this.listeners = new Map();
       this.remoteDescription = null;
       connections.push(this);
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this.listeners.get(type) || new Set();
+      listeners.add(listener);
+      this.listeners.set(type, listeners);
     }
 
     addIceCandidate() {
@@ -124,7 +131,23 @@ function createFakeRtcNetwork() {
 
     setLocalDescription(description) {
       this.localDescription = description;
+      this.iceGatheringState = "gathering";
+      setTimeout(() => {
+        this.localDescription = {
+          ...description,
+          sdp: `${description.sdp}\na=candidate:fake`,
+        };
+        this.iceGatheringState = "complete";
+        for (const listener of
+          this.listeners.get("icegatheringstatechange") || []) {
+          listener();
+        }
+      }, 0);
       return Promise.resolve();
+    }
+
+    removeEventListener(type, listener) {
+      this.listeners.get(type)?.delete(listener);
     }
 
     setRemoteDescription(description) {
@@ -160,12 +183,14 @@ async function loadGame(search = "", options = {}) {
   const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
   let source = html.match(/<script>([\s\S]*?)<\/script>/)[1];
   source = source.replace(
-    "        renderRoster();\n        if (invitationRoomId",
+    "        renderRoster();\n        if (invitationCode",
     `        globalThis.__gameTest = {
           applyNetworkSnapshot,
           createPeerAdapter,
           createGameState,
           createInviteUrl,
+          decodeSessionDescription,
+          encodeSessionDescription,
           serializeNetworkState,
           setSelectedMode,
           stepMultiplayerGame,
@@ -173,7 +198,7 @@ async function loadGame(search = "", options = {}) {
           getState: () => state,
         };
         renderRoster();
-        if (invitationRoomId`
+        if (invitationCode`
   );
 
   const ids = Object.fromEntries(
@@ -188,9 +213,15 @@ async function loadGame(search = "", options = {}) {
       "connection-status",
       "invite-block",
       "invite-link",
+      "answer-block",
+      "answer-code",
+      "answer-entry-block",
+      "answer-input",
       "game",
       "choose-again",
       "copy-invite",
+      "copy-answer",
+      "connect-answer",
       "cancel-lobby",
     ].map((id) => [id, new FakeElement()])
   );
@@ -215,16 +246,17 @@ async function loadGame(search = "", options = {}) {
     return button;
   });
   const meta = {
-    'meta[name="kuadrant-signaling-url"]': { content: "" },
     'meta[name="kuadrant-ice-servers"]': {
       content: '[{"urls":"stun:example.invalid:3478"}]',
     },
   };
   const origin = options.origin || "https://clash.example.test";
+  const pageUrl = new URL(search || "/", `${origin}/`);
   const location = {
-    href: `${origin}/${search}`,
-    origin,
-    search,
+    href: pageUrl.href,
+    origin: pageUrl.origin,
+    search: pageUrl.search,
+    hash: pageUrl.hash,
   };
   const windowListeners = new Map();
   const document = {
@@ -262,8 +294,12 @@ async function loadGame(search = "", options = {}) {
     navigator: { clipboard: { writeText: async () => {} } },
     performance,
     RTCPeerConnection: options.RTCPeerConnection,
+    TextDecoder,
+    TextEncoder,
     URL,
     URLSearchParams,
+    atob,
+    btoa,
     window,
     cancelAnimationFrame() {},
     requestAnimationFrame: () => 1,
@@ -275,22 +311,51 @@ async function loadGame(search = "", options = {}) {
   return { api: context.__gameTest, ids };
 }
 
-test("multiplayer mode is selected by an invitation link", async () => {
-  const { api } = await loadGame(
-    "?mode=multiplayer&room=abcdefghijklmnopqrstuvwx"
-  );
+test("multiplayer mode is selected by a static invitation link", async () => {
+  const { api: encoder } = await loadGame();
+  const offer = encoder.encodeSessionDescription({
+    type: "offer",
+    sdp: "fake-offer",
+  });
+  const { api } = await loadGame(`?mode=multiplayer#offer=${offer}`);
   assert.equal(api.getSelectedMode(), "multiplayer");
 });
 
-test("challenge links carry the room and mode", async () => {
+test("challenge links carry the offer in the URL fragment", async () => {
   const { api } = await loadGame();
-  const invitation = new URL(
-    api.createInviteUrl("abcdefghijklmnopqrstuvwx")
-  );
+  const description = { type: "offer", sdp: "fake-offer" };
+  const invitation = new URL(api.createInviteUrl(description));
   assert.equal(invitation.searchParams.get("mode"), "multiplayer");
-  assert.equal(
-    invitation.searchParams.get("room"),
-    "abcdefghijklmnopqrstuvwx"
+  assert.equal(invitation.searchParams.get("room"), null);
+  assert.equal(invitation.searchParams.get("signal"), null);
+  const encodedOffer = new URLSearchParams(invitation.hash.slice(1)).get(
+    "offer"
+  );
+  const decodedOffer = api.decodeSessionDescription(encodedOffer, "offer");
+  assert.equal(decodedOffer.type, description.type);
+  assert.equal(decodedOffer.sdp, description.sdp);
+  assert.equal(invitation.href.includes("fake-offer"), false);
+});
+
+test("static multiplayer has no signalling API dependency", async () => {
+  const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
+  assert.doesNotMatch(html, /\bfetch\s*\(/);
+  assert.doesNotMatch(html, /kuadrant-signaling-url|\/signal\//);
+});
+
+test("session descriptions reject malformed and mismatched codes", async () => {
+  const { api } = await loadGame();
+  const offer = api.encodeSessionDescription({
+    type: "offer",
+    sdp: "fake-offer",
+  });
+  assert.throws(
+    () => api.decodeSessionDescription(offer, "answer"),
+    /Invalid WebRTC answer code/
+  );
+  assert.throws(
+    () => api.decodeSessionDescription("not-a-code", "answer"),
+    /Invalid WebRTC answer code/
   );
 });
 
@@ -321,30 +386,72 @@ test("network snapshots preserve projectile ownership", async () => {
   });
   state.projectiles.push({
     owner: state.cpu,
+    kind: "shard",
     x: 400,
     y: 300,
     velocityX: -400,
+    spawnAt: 10,
+    createdAt: 0,
     size: 10,
   });
   const snapshot = api.serializeNetworkState(state);
+  snapshot.sequence = 0;
   assert.equal(snapshot.projectiles[0].ownerSide, "cpu");
   assert.equal(api.applyNetworkSnapshot(snapshot), true);
   assert.equal(api.getState().projectiles[0].owner, api.getState().cpu);
+  assert.equal(api.applyNetworkSnapshot(snapshot), false);
 });
 
-test("two peer adapters connect through the relay and exchange both channels", async () => {
-  const server = createKuadrantServer();
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const origin = `http://127.0.0.1:${server.address().port}`;
+test("network snapshots reject malformed state without consuming sequence", async () => {
+  const { api } = await loadGame();
+  const state = api.createGameState(0, 1, {
+    cpuPortraitIndex: 2,
+    mode: "multiplayer",
+  });
+  const snapshot = api.serializeNetworkState(state);
+  snapshot.sequence = 41;
+
+  assert.equal(
+    api.applyNetworkSnapshot({
+      ...snapshot,
+      player: { ...snapshot.player, portraitIndex: 999 },
+    }),
+    false
+  );
+  assert.equal(
+    api.applyNetworkSnapshot({ ...snapshot, projectiles: [null] }),
+    false
+  );
+  assert.equal(api.applyNetworkSnapshot(snapshot), true);
+  assert.equal(api.getState().player.portraitIndex, 1);
+});
+
+test("snapshot sequences remain monotonic across multiplayer rematches", async () => {
+  const html = await readFile(new URL("./index.html", import.meta.url), "utf8");
+  const hostMatch = html.match(
+    /function beginNetworkHostMatch\(\) \{([\s\S]*?)\n        \}/
+  )[1];
+  const rematchStart = html.match(
+    /message\.type === "rematch-start"\) \{([\s\S]*?)\n          \}/
+  )[1];
+  assert.doesNotMatch(hostMatch, /networkSnapshotSequence\s*=\s*0/);
+  assert.doesNotMatch(
+    rematchStart,
+    /lastAppliedNetworkSnapshotSequence\s*=\s*-1/
+  );
+});
+
+test("two peer adapters connect through a manual offer and answer", async () => {
   const RTCPeerConnection = createFakeRtcNetwork();
   const [{ api: hostApi }, { api: guestApi }] = await Promise.all([
-    loadGame("", { origin, RTCPeerConnection }),
-    loadGame("", { origin, RTCPeerConnection }),
+    loadGame("", { RTCPeerConnection }),
+    loadGame("", { RTCPeerConnection }),
   ]);
-  const roomId = "peeradapterintegrationroom";
   const hostControl = [];
   const guestControl = [];
   const guestState = [];
+  let hostOffer;
+  let guestAnswer;
   let readyCount = 0;
   let resolveReady;
   const ready = new Promise((resolve) => {
@@ -364,20 +471,30 @@ test("two peer adapters connect through the relay and exchange both channels", a
   const host = hostApi.createPeerAdapter({
     ...callbacks,
     role: "host",
-    roomId,
+    onLocalDescription: (description) => {
+      hostOffer = description;
+    },
     onControl: (message) => hostControl.push(message),
     onState() {},
   });
   const guest = guestApi.createPeerAdapter({
     ...callbacks,
     role: "guest",
-    roomId,
+    onLocalDescription: (description) => {
+      guestAnswer = description;
+    },
     onControl: (message) => guestControl.push(message),
     onState: (message) => guestState.push(message),
   });
 
   try {
-    await Promise.all([host.start(), guest.start()]);
+    await host.start();
+    assert.equal(hostOffer.type, "offer");
+    assert.match(hostOffer.sdp, /candidate:fake/);
+    await guest.start(hostOffer);
+    assert.equal(guestAnswer.type, "answer");
+    assert.match(guestAnswer.sdp, /candidate:fake/);
+    await host.acceptAnswer(guestAnswer);
     await Promise.race([
       ready,
       new Promise((_, reject) =>
@@ -397,6 +514,5 @@ test("two peer adapters connect through the relay and exchange both channels", a
   } finally {
     host.close();
     guest.close();
-    await new Promise((resolve) => server.close(resolve));
   }
 });
