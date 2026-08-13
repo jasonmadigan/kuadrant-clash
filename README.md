@@ -4,7 +4,7 @@ A tiny, dependency-free rooftop fighting game, extracted from the Kuadrant Conso
 
 ## Play it
 
-<https://jasonmadigan.com/kuadrant-clash/>
+[jasonmadigan.github.io](https://jasonmadigan.github.io/kuadrant-clash)
 
 ## Run it locally
 
